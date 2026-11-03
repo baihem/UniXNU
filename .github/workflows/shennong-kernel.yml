@@ -1,0 +1,130 @@
+name: shennong kernel
+
+# 小米14 Pro (shennong / SM8650) —— XNU + payload 构建
+# 放在你自己的 UniXNU 私有 fork 里：.github/workflows/shennong-kernel.yml
+# 产物含 Apple 派生二进制，只能私有仓库，不要公开分发。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      UNIXNU_DEVICE: ${{ github.workspace }}/device
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # 1. 上游 UniXNU 构建驱动（本仓库 = 你在 UniXNU 上的 fork）
+      - name: Check out UniXNU
+        uses: actions/checkout@v4
+        with:
+          path: unixnu
+          submodules: recursive
+
+      # 2. 设备仓库：默认用 shennong 移植仓库。
+      #    想换成自己的 fork，就在 Settings -> Secrets and variables -> Actions -> Variables
+      #    新增 SHENNONG_DEVICE = 你的账号/UniXNU-shennong
+      - name: Check out the device repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SHENNONG_DEVICE || 'YX2748198202-lab/UniXNU-shennong' }}
+          path: device
+
+      - name: Check out uefi-sheng (panic screen font)
+        uses: actions/checkout@v4
+        with:
+          repository: UniXNU/uefi-sheng
+          ref: sheng
+          path: uefi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install host tools
+        run: |
+          brew install llvm lld mtools dtc
+          if ! command -v unifdef >/dev/null; then
+            brew install unifdef
+            echo "$(brew --prefix unifdef)/bin" >> "$GITHUB_PATH"
+          fi
+          xcodebuild -version
+
+      - name: Fetch device modules
+        working-directory: unixnu
+        run: ./unixnu fetch -D "$UNIXNU_DEVICE"
+
+      - name: Defconfig
+        working-directory: unixnu
+        run: ./unixnu defconfig shennong_defconfig -D "$UNIXNU_DEVICE"
+
+      - name: Build kernel (two passes)
+        working-directory: unixnu
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UNIXNU_UEFI: ${{ github.workspace }}/uefi
+        run: |
+          set -euo pipefail
+          # 上游 xnu_symbols.py 要容忍第一遍链接失败后不存在的 .o
+          SYMFILE=scripts/xnu_symbols.py
+          if ! grep -q 'is_file()' "$SYMFILE"; then
+            sed -i '' 's/paths = \[str(path) for path in paths\]/paths = [str(path) for path in paths if Path(path).is_file()]/' "$SYMFILE"
+          fi
+          if ./unixnu build kernel; then echo "first pass rc=0"; else echo "::warning::first pass failed (bootstrap, expected while ShengPlatformPower.a is absent)"; fi
+          TREE=$(ls -d out/shennong/*/*/tree 2>/dev/null | head -1)
+          test -d "$TREE" || { echo "::error::no build tree"; ls -R out/shennong | head -50; exit 1; }
+          mkdir -p "$TREE/drivers"
+          [ -f "$TREE/drivers/ShengUfs/NativeUfs.cpp" ] || \
+            git clone --depth 1 https://github.com/UniXNU/NativeUfs.git "$TREE/drivers/ShengUfs"
+          rm -rf /tmp/VerifiedRoot
+          git clone --depth 1 https://github.com/UniXNU/VerifiedRoot.git /tmp/VerifiedRoot || true
+          cp /tmp/VerifiedRoot/verified_root.h /tmp/VerifiedRoot/VerifiedBlockPolicy.h "$TREE/drivers/ShengUfs/" 2>/dev/null || true
+          export PATH="$(brew --prefix llvm)/bin:$PATH"
+          python3 "$TREE/scripts/build-sheng-platform-power.py" || true
+          if [ -f "$TREE/scripts/build-mockfs-fixture.py" ]; then python3 "$TREE/scripts/build-mockfs-fixture.py" || true; fi
+          ./unixnu build kernel
+
+      - name: Build payload
+        working-directory: unixnu
+        run: ./unixnu build payload --uefi "$GITHUB_WORKSPACE/uefi"
+
+      - name: Patch AppleARMCPU IONameMatch (cpu -> xpu)
+        working-directory: unixnu
+        run: |
+          PAY=$(ls -t out/shennong/*/*/payload/payload.img 2>/dev/null | head -1)
+          test -n "$PAY"
+          python3 "$GITHUB_WORKSPACE/device/scripts/patch-applearmcpu-ioname.py" \
+            --payload "$PAY" --out "${PAY%.img}-xpu.img"
+          python3 "$GITHUB_WORKSPACE/device/scripts/patch-applearmcpu-ioname.py" \
+            --payload "${PAY%.img}-xpu.img" --check
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shennong-kernel-${{ github.run_attempt }}
+          retention-days: 5
+          if-no-files-found: warn
+          path: |
+            unixnu/out/shennong/*/*/payload/payload-xpu.img
+            unixnu/out/shennong/*/*/payload/payload.img
+            unixnu/out/shennong/*/*/kernel/kernel.macho*
+            unixnu/out/shennong/*/*/logs/*.log
+
+      - name: Summary
+        if: always()
+        working-directory: unixnu
+        run: |
+          echo "### shennong build" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -l out/shennong/*/*/payload/payload*.img >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no payload" >> "$GITHUB_STEP_SUMMARY"
+          for f in out/shennong/*/*/payload/payload-xpu.img; do
+            [ -f "$f" ] && echo "$f is $(stat -f%z "$f") bytes (must be 201326592)" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
