@@ -43,6 +43,12 @@ jobs:
           ref: sheng
           path: uefi
 
+      # 3. 目标 OS = iOS 27（24A446 / arm64e / XNU 12377）。
+      #    UniXNU 只提供 iPadOS 的 OS profile；--os 27 选的是 arm64e 的 27.0.1 配置，
+      #    内核与驱动完全相同，用户态最终换成 iPhone 固件。
+      - name: Pick target OS
+        run: echo 'OS_ARGS=--os 27' >> "$GITHUB_ENV"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -58,11 +64,11 @@ jobs:
 
       - name: Fetch device modules
         working-directory: unixnu
-        run: ./unixnu fetch -D "$UNIXNU_DEVICE"
+        run: ./unixnu fetch $OS_ARGS -D "$UNIXNU_DEVICE"
 
       - name: Defconfig
         working-directory: unixnu
-        run: ./unixnu defconfig shennong_defconfig -D "$UNIXNU_DEVICE"
+        run: ./unixnu defconfig shennong_defconfig $OS_ARGS -D "$UNIXNU_DEVICE"
 
       - name: Build kernel (two passes)
         working-directory: unixnu
@@ -76,7 +82,7 @@ jobs:
           if ! grep -q 'is_file()' "$SYMFILE"; then
             sed -i '' 's/paths = \[str(path) for path in paths\]/paths = [str(path) for path in paths if Path(path).is_file()]/' "$SYMFILE"
           fi
-          if ./unixnu build kernel; then echo "first pass rc=0"; else echo "::warning::first pass failed (bootstrap, expected while ShengPlatformPower.a is absent)"; fi
+          if ./unixnu build kernel $OS_ARGS; then echo "first pass rc=0"; else echo "::warning::first pass failed (bootstrap, expected while ShengPlatformPower.a is absent)"; fi
           TREE=$(ls -d out/shennong/*/*/tree 2>/dev/null | head -1)
           test -d "$TREE" || { echo "::error::no build tree"; ls -R out/shennong | head -50; exit 1; }
           mkdir -p "$TREE/drivers"
@@ -88,12 +94,25 @@ jobs:
           export PATH="$(brew --prefix llvm)/bin:$PATH"
           python3 "$TREE/scripts/build-sheng-platform-power.py" || true
           if [ -f "$TREE/scripts/build-mockfs-fixture.py" ]; then python3 "$TREE/scripts/build-mockfs-fixture.py" || true; fi
-          ./unixnu build kernel
+          ./unixnu build kernel $OS_ARGS
 
       - name: Build payload
         working-directory: unixnu
-        run: ./unixnu build payload --uefi "$GITHUB_WORKSPACE/uefi"
+        run: ./unixnu build payload $OS_ARGS --uefi "$GITHUB_WORKSPACE/uefi"
 
+      - name: Preflight (payload size)
+        working-directory: unixnu
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in out/shennong/*/*/payload/payload*.img; do
+            [ -f "$f" ] || continue
+            sz=$(stat -f%z "$f")
+            echo "$f $sz bytes"
+            [ "$sz" = "201326592" ] || { echo "::error::$f is $sz, must be 201326592"; fail=1; }
+          done
+          [ -f out/shennong/*/*/payload/payload.img ] 2>/dev/null || true
+          exit $fail
       - name: Patch AppleARMCPU IONameMatch (cpu -> xpu)
         working-directory: unixnu
         run: |
